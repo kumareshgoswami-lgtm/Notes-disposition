@@ -249,7 +249,7 @@ def main():
     grid, rca_map = load_grid(xl), load_rca(xl)
     f = audit(df, grid, rca_map)
 
-    key_cols = ["#", "Client Name", "Unique ID", "Agent", "Emp ID", "Derived Status", "Status Basis", "Claim Status", "Category", "RCA",
+    key_cols = ["#", "Client Name", "Unique ID", "Agent", "Emp ID", "Derived Status", "Status Basis", "Category", "RCA",
                 ACT, "Status Source", "Balance Amount", NOTES]
     f = f.merge(df[key_cols], left_on="row", right_index=True).drop(columns="row")
 
