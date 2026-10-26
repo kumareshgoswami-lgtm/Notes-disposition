@@ -104,6 +104,35 @@ SAME_FAMILY = [  # action pairs that must not be flagged against each other
 ]
 
 
+DERIVE_STATUS = [  # checked against the note in order; first hit wins
+    ("Not on File", NOTE_STATUS[0][1]),
+    ("Rejected", rx(r"\brejected\b", r"rejection", r"clearing ?house (error|reject)")),
+    ("Claim Edit/Scrubber Edits", rx(r"batch error", r"scrubber", r"stuck in (batch|pms|validation)", r"claim edit")),
+    ("Pending - Info Requested", rx(r"(requested|request(ing)?|asked for|need(s)?) (the )?(mr|medical records|records|w-?9|c-?9|cob|questionnaire|itemi[sz]ed|primary eob|wol|accident)",
+                                    r"\b(adr|records request)\b")),
+    ("Denied", NOTE_STATUS[2][1]),
+    ("Scheduled to Pay", rx(r"scheduled to pay", r"check (is )?(not yet )?(issued|mailed)", r"payment (is )?pending", r"finali[sz]ed.{0,30}(not|yet).{0,10}paid")),
+    ("Paid", NOTE_STATUS[3][1]),
+    ("In Process", rx(r"in process", r"under review", r"pending review", r"in review", r"within (the )?tat", r"reprocess")),
+    ("Acknowledged/Received", rx(r"acknowledg", r"claim (was )?received", r"\b277ca\b")),
+]
+
+
+def derive_status(r, note):
+    """Claim Status column is stale: work status out from rejection/denial fields + the note."""
+    if pd.notna(r["Rejection Category"]) or pd.notna(r["Rejection Reason"]):
+        return "Rejected", "Rejection fields"
+    for st, pat in DERIVE_STATUS:
+        if pat.search(note):
+            if st == "Denied" or st in ("Paid", "Scheduled to Pay", "In Process", "Acknowledged/Received"):
+                if pd.notna(r["CARC"]) or pd.notna(r["Category"]):
+                    return "Denied", "Denial fields + note"
+            return st, "Note text"
+    if pd.notna(r["CARC"]) or pd.notna(r["Category"]):
+        return "Denied", "Denial fields"
+    return None, "Undetermined"
+
+
 def same_family(a, b):
     return a == b or any(a in f and b in f for f in SAME_FAMILY)
 
@@ -121,8 +150,11 @@ def audit(df, grid, rca_map):
     def add(r, code, sev, area, msg):
         findings.append(dict(row=r.name, Code=code, Severity=sev, Area=area, Finding=msg))
 
+    derived = []
     for _, r in df.iterrows():
-        st = r["Claim Status"] if pd.notna(r["Claim Status"]) else None
+        note = str(r[NOTES])
+        st, basis = derive_status(r, note)
+        derived.append((st or "Undetermined", basis))
         act_raw = str(r[ACT]).strip()
         act = ACTION_ALIAS.get(act_raw, act_raw)
         cat, rca = r["Category"], r["RCA"]
@@ -131,8 +163,6 @@ def audit(df, grid, rca_map):
 
         # --- A. Form / mandatory-field compliance (sheet 1)
         if not coding_form:
-            if st is None:
-                add(r, "F01", "Non-Fatal", "Claim Status", "Claim Status blank (mandatory on all non-Coding forms)")
             if pd.isna(r["Status Source"]):
                 add(r, "F02", "Non-Fatal", "Status Source", "Status Source blank (mandatory)")
             if st == "Denied" and pd.isna(cat):
@@ -140,7 +170,8 @@ def audit(df, grid, rca_map):
             if st == "Rejected" and pd.isna(r["Rejection Category"]):
                 add(r, "F04", "Non-Fatal", "Rejection Category", "Rejected claim without Rejection Category")
             if st == "Rejected" and pd.isna(rca):
-                add(r, "F05", "Fatal", "RCA", "Rejected claim without RCA (mandatory on Rejection)")
+                sev = "Fatal" if basis == "Rejection fields" else "Non-Fatal"  # note-only status: verify first
+                add(r, "F05", sev, "RCA", "Rejected claim without RCA (mandatory on Rejection)")
             if r["Status Source"] in CALL_SOURCES and pd.isna(r["Representative Name"]):
                 add(r, "F06", "Non-Fatal", "Rep Name", "Status from payer call/IVR but Representative Name blank")
             if act == "Escalated to Onshore Team" and pd.isna(r["Escalation Reason"]):
@@ -186,16 +217,6 @@ def audit(df, grid, rca_map):
                         add(r, "N01", "Fatal", "Note vs Action",
                             f"Note's concluding action reads as '{inf_act}' but disposition is '{act_raw}'")
                     break
-        if st and not coding_form:
-            for inf_st, pat in NOTE_STATUS:
-                if pat.search(note):
-                    if inf_st == "Denied" and st in ("Paid",) and "partial" not in n_low:
-                        add(r, "N02", "Non-Fatal", "Note vs Status", f"Note describes a denial but Claim Status is '{st}'")
-                    if inf_st == "Not on File" and st not in ("Not on File", "Rejected", "Claim Edit/Scrubber Edits", "Acknowledged/Received"):
-                        add(r, "N02", "Non-Fatal", "Note vs Status", f"Note says claim not on file but Claim Status is '{st}'")
-                    if inf_st == "Paid" and st in ("Not on File", "In Process"):
-                        add(r, "N02", "Non-Fatal", "Note vs Status", f"Note shows payment but Claim Status is '{st}'")
-                    break
         if act.startswith("No action needed - zero balance") and re.search(r"(need|allow) (more )?time to post|not posted|adjustment done", n_low):
             add(r, "N03", "Fatal", "Note vs Action", "Zero-balance closure but note shows balance still open / pending posting / adjusted")
         if act.startswith("No action needed - out of scope for OJT") and re.search(r"transferr|adjusted|billed|submitted", n_low):
@@ -216,6 +237,8 @@ def audit(df, grid, rca_map):
                    "Additional Information Submitted", "Follow-Up Required", "Sent for Reprocessing") \
                 and not re.search(r"\btat\b|\btfl\b|days|follow ?up|allow|wait", n_low):
             add(r, "Q04", "Non-Fatal", "Note Quality", "Parked action without TAT / next follow-up in note")
+    df["Derived Status"] = [d[0] for d in derived]
+    df["Status Basis"] = [d[1] for d in derived]
     return pd.DataFrame(findings)
 
 
@@ -226,7 +249,7 @@ def main():
     grid, rca_map = load_grid(xl), load_rca(xl)
     f = audit(df, grid, rca_map)
 
-    key_cols = ["#", "Client Name", "Unique ID", "Agent", "Emp ID", "Claim Status", "Category", "RCA",
+    key_cols = ["#", "Client Name", "Unique ID", "Agent", "Emp ID", "Derived Status", "Status Basis", "Claim Status", "Category", "RCA",
                 ACT, "Status Source", "Balance Amount", NOTES]
     f = f.merge(df[key_cols], left_on="row", right_index=True).drop(columns="row")
 
@@ -255,10 +278,12 @@ def main():
                             labels=["Red (<90)", "Amber (90-95)", "Watch (95-98)", "Green (>=98)"])
 
     clients = df.groupby("Client Name").apply(score, include_groups=False).reset_index().sort_values("Critical Accuracy %")
+    status_mix = (df.groupby(["Derived Status", "Status Basis"]).size().rename("Claims").reset_index()
+                  .sort_values("Claims", ascending=False))
     pareto = (f.groupby(["Code", "Severity", "Area", f["Finding"].str.replace(r"'[^']*'", "'…'", regex=True)])
                 .size().rename("Count").reset_index().sort_values("Count", ascending=False))
     pareto["Cum %"] = (pareto["Count"].cumsum() / pareto["Count"].sum() * 100).round(1)
-    combo = (f.loc[f.Code == "G01"].groupby(["Claim Status", ACT]).size().rename("Count")
+    combo = (f.loc[f.Code == "G01"].groupby(["Derived Status", ACT]).size().rename("Count")
              .reset_index().sort_values("Count", ascending=False))
     n = len(df)
     summary = pd.DataFrame([
@@ -269,14 +294,15 @@ def main():
         ("Total defects logged", len(f)),
         ("Balance on fatal claims $", round(df["Fatal $ at risk"].sum(), 2)),
         ("Duplicate Unique IDs worked", int(df["Unique ID"].duplicated().sum())),
+        ("Status basis", "Claim Status column ignored (stale); status derived from rejection/denial fields + note text"),
         ("Convention", "Fatal = binary per claim; Critical acc = 1 - fatal claims/claims; Overall = 1 - claims with any defect/claims"),
         ("Caveat", "N-codes are keyword inference from notes - QA confirms before agent feedback"),
     ], columns=["Metric", "Value"])
     legend = pd.DataFrame([
-        ("F01-F09", "Form / mandatory-field compliance (Overview tab)"),
+        ("F02-F09", "Form / mandatory-field compliance (Overview tab)"),
         ("G01-G02", "Status x Resolution Action grid (Final Status Action Matrix)"),
         ("R01-R04", "Denial Category / RCA validity (Claim Status - RCA tab)"),
-        ("N01-N05", "Note vs disposition contradiction (inferred from note text)"),
+        ("N01, N03-N05", "Note vs disposition contradiction (inferred from note text)"),
         ("Q01-Q04", "Note documentation quality (action definitions: 'Notes must capture')"),
     ], columns=["Code family", "Meaning"])
 
@@ -286,6 +312,7 @@ def main():
         agents.to_excel(w, sheet_name="Agent Scorecard", index=False)
         pareto.to_excel(w, sheet_name="Defect Pareto", index=False)
         combo.to_excel(w, sheet_name="Grid Violations", index=False)
+        status_mix.to_excel(w, sheet_name="Derived Status", index=False)
         clients.to_excel(w, sheet_name="Client View", index=False)
         f.sort_values(["Severity", "Agent"]).to_excel(w, sheet_name="Findings (Line Level)", index=False)
         for ws in w.book.worksheets:

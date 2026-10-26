@@ -52,7 +52,23 @@ Requires Python 3.10+, `pandas`, `openpyxl`.
 
 ---
 
-## 3. Audit scoring convention
+## 3. Claim status: derived, not read
+
+The `Claim Status` column in the dump is **stale** and is **ignored** for scoring (it's kept in the
+output for reference only). `derive_status()` works out each claim's status in this order:
+
+1. Rejection Category / Rejection Reason filled → **Rejected** (basis: "Rejection fields")
+2. Keyword match in the note, first hit wins: Not on File → Rejected → Claim Edit/Scrubber → Pending - Info Requested →
+   Denied → Scheduled to Pay → Paid → In Process → Acknowledged/Received (basis: "Note text").
+   If CARC or Denial Category is filled, a Paid/In-Process-type note still resolves to **Denied** ("Denial fields + note").
+3. CARC or Denial Category filled with no note signal → **Denied** ("Denial fields")
+4. Otherwise **Undetermined**. The grid check (G01) is skipped for these claims.
+
+F01 (Claim Status blank) and N02 (note vs Claim Status) were removed. F05 is fatal only when the
+Rejected status comes from the rejection fields; a note-only Rejected status scores it non-fatal (verify first).
+Output tab **Derived Status** shows how many claims came from each basis.
+
+## 4. Audit scoring convention
 
 - Every claim is audited (100% population, not a sample).
 - **Fatal** = the error changes the financial or claim outcome (wrong action or status, a recovery route lost, duplicate-denial risk, a mandatory RCA missing on a rejection).
@@ -67,11 +83,10 @@ Requires Python 3.10+, `pandas`, `openpyxl`.
 
 | Code | Severity | Check |
 |---|---|---|
-| F01 | Non-fatal | Claim Status blank (non-Coding form) |
 | F02 | Non-fatal | Status Source blank |
 | F03 | Non-fatal | Denied without Denial Category |
 | F04 | Non-fatal | Rejected without Rejection Category |
-| F05 | **Fatal** | Rejected without RCA (mandatory on Rejection) |
+| F05 | **Fatal** (non-fatal if status is note-derived) | Rejected without RCA (mandatory on Rejection) |
 | F06 | Non-fatal | Status from Payer Call/IVR but Representative Name blank |
 | F07 | Non-fatal | Escalated without Escalation Reason |
 | F08 | **Fatal** | Coding-queue claim closed with a non-coding action |
@@ -83,7 +98,6 @@ Requires Python 3.10+, `pandas`, `openpyxl`.
 | R03 | Non-fatal | RCA not in the list for its status/category |
 | R04 | Non-fatal | Denied with category but no RCA (needed for trending) |
 | N01 | **Fatal** | Note's concluding action contradicts the disposition |
-| N02 | Non-fatal | Note's status (denied / not on file / paid) contradicts Claim Status |
 | N03 | **Fatal** | "Zero balance" or "OJT out of scope" closure while the note shows open balance or work done |
 | N04 | **Fatal** | Claim Resubmitted (freq 1) on a denied claim with an ICN; should be Corrected Claim |
 | N05 | **Fatal** | Adjustment while note cites an open recovery route and no adjustment |
@@ -98,11 +112,19 @@ Alias used: `Escalate to Client` (data) = `Escalated to Onshore Team` (rules).
 
 ### Output workbook tabs
 Summary + code legend · Agent Scorecard (accuracy, $ at risk, top defect, zone) · Defect Pareto ·
-Grid Violations (status × action) · Client View · Findings (Line Level).
+Grid Violations (derived status × action) · Derived Status · Client View · Findings (Line Level).
 
 ---
 
-## 4. Baseline result: 23-Oct-2026 dump
+## 5. Baseline result: 23-Oct-2026 dump
+
+### Re-run with derived status (current logic)
+- 1,892 claims, 61 agents. **Critical accuracy 92.5%**, overall accuracy 60.6%. 142 fatal claims, $150.1K balance on fatal claims.
+- Agent zones: Green 27, Watch 9, Amber 8, Red 17.
+- Derived status: Denied 1,010 · Undetermined 283 · Paid 222 · Rejected 133 · Claim Edit 130 · In Process 47 · Not on File 35 · Pending 26 · other 6.
+- Top defects: F03 denied without Denial Category (193), Q04 (190), R04 (160), F02 (147), Q03 (117).
+
+### First run (used the stale Claim Status column; superseded)
 
 - 1,892 claims, 61 agents, 12 clients.
 - **Critical accuracy 91.5%**, overall accuracy 62.6%. 161 fatal claims, $164.7K balance on fatal claims.
@@ -120,7 +142,7 @@ Grid Violations (status × action) · Client View · Findings (Line Level).
 
 ---
 
-## 5. PHI handling (no BAA in place)
+## 6. PHI handling (no BAA in place)
 
 - Assume **no BAA** with any AI or cloud vendor. Raw dumps, audit results, quarantine files and the REID KEY **never** go to a cloud service or to git (`.gitignore` blocks `*.xlsx`, `*.csv`, `scrub_out/`).
 - `phi_scrub.py` (Safe Harbor style):
@@ -133,7 +155,7 @@ Grid Violations (status × action) · Client View · Findings (Line Level).
 
 ---
 
-## 6. Roadmap
+## 7. Roadmap
 
 1. **Calibrate (week 1):** QA manually audits about 50 fatal flags plus clean samples. Tune regexes to at least 90% precision, then lock which codes are fatal.
 2. **Run it daily:** automated 100% check. A QA person confirms fatal flags, plus a random 5% of clean claims.
@@ -148,7 +170,7 @@ Grid Violations (status × action) · Client View · Findings (Line Level).
 
 ---
 
-## 7. Files
+## 8. Files
 
 | File | Purpose |
 |---|---|
