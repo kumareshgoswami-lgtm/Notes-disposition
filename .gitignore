@@ -1,0 +1,5 @@
+*.xlsx
+*.xls
+*.csv
+scrub_out/
+__pycache__/
